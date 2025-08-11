@@ -1,4 +1,4 @@
-module tracerr2
+module github.com/xplshn/tracerr2
 
 go 1.24.6
 
