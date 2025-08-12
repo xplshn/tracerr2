@@ -4,6 +4,9 @@ A Go error tracing library that provides detailed, syntax-highlighted stack trac
 
 ### Usage
 
+<img width="1505" height="976" alt="image" src="https://github.com/user-attachments/assets/29c20011-645e-4172-b482-32c795df1196" />
+
+
 ```go
 package main
 
