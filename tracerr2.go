@@ -5,6 +5,7 @@ package tracerr
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,10 +33,11 @@ type Frame struct {
 	Function string // The name of the function.
 }
 
-// Error represents an error with an associated stack trace.
+// Error represents an error with an associated stack trace and a potential cause.
 type Error struct {
 	Msg    string  // The error message.
 	Frames []Frame // The stack trace frames.
+	cause  error   // The wrapped error.
 }
 
 // New creates a new Tracerr error with a message and a stack trace.
@@ -48,6 +50,28 @@ func New(msg string) *Error {
 // It captures the stack trace at the point it is called.
 func Errorf(format string, args ...interface{}) *Error {
 	return newError(fmt.Sprintf(format, args...), 2)
+}
+
+// Wrap annotates an existing error with a new message and a stack trace.
+// If err is nil, Wrap returns nil. The original error is preserved.
+func Wrap(err error, msg string) *Error {
+	if err == nil {
+		return nil
+	}
+	e := newError(msg, 2)
+	e.cause = err
+	return e
+}
+
+// Wrapf annotates an existing error with a new formatted message and a stack trace.
+// If err is nil, Wrapf returns nil. The original error is preserved.
+func Wrapf(err error, format string, args ...interface{}) *Error {
+	if err == nil {
+		return nil
+	}
+	e := newError(fmt.Sprintf(format, args...), 2)
+	e.cause = err
+	return e
 }
 
 // newError is the internal helper to create an error and capture the stack.
@@ -66,6 +90,10 @@ func newError(msg string, skip int) *Error {
 		} else {
 			funcName = "<unknown>"
 		}
+		// Stop capturing frames when we reach the Go runtime entry points.
+		if strings.HasPrefix(funcName, "runtime.") {
+			break
+		}
 		frames = append(frames, Frame{
 			File:     file,
 			Line:     line,
@@ -78,9 +106,17 @@ func newError(msg string, skip int) *Error {
 	}
 }
 
-// Error returns the error message without the stack trace, satisfying the error interface.
+// Error returns the error message, including messages from wrapped errors.
 func (e *Error) Error() string {
+	if e.cause != nil {
+		return e.Msg + ": " + e.cause.Error()
+	}
 	return e.Msg
+}
+
+// Unwrap returns the wrapped error, allowing compatibility with standard errors.Is and errors.As.
+func (e *Error) Unwrap() error {
+	return e.cause
 }
 
 // Print prints the error message and stack trace to os.Stderr.
@@ -88,62 +124,75 @@ func (e *Error) Print() {
 	e.Fprint(os.Stderr)
 }
 
-// Fprint formats and writes the error and stack trace to the given writer.
-// It includes the error message, stack frames, and highlighted source code context.
+// Fprint formats and writes the full error chain and stack traces to the given writer.
+// It includes the error message, stack frames, and highlighted source code context for each error in the chain.
 func (e *Error) Fprint(w io.Writer) {
-	fmt.Fprintf(w, "%s%s%s\n", red(e.Msg), colorReset, "")
-	for _, frame := range e.Frames {
-		// Format the frame information (e.g., "at main.Gamma (main.go:123)")
-		location := gray(fmt.Sprintf("%s:%d", filepath.Base(frame.File), frame.Line))
-		function := yellow(frame.Function)
-		fmt.Fprintf(w, "  at %s (%s)\n", function, location)
+	var currentErr error = e
+	isFirst := true
 
-		// Read the source code lines around the error
-		lines, startLine, err := readSourceContextLines(frame.File, frame.Line, 1)
-		if err != nil {
-			fmt.Fprintf(w, "    %s\n", gray("Could not read source file"))
+	for currentErr != nil {
+		// Check if the current error in the chain is a *tracerr.Error
+		tracerrErr, ok := currentErr.(*Error)
+
+		if !isFirst {
+			fmt.Fprintf(w, "\n%sCaused by: %s", formatItalic, colorReset)
+		}
+
+		if ok {
+			// It's a tracerr error, print its message and stack trace.
+			fmt.Fprintf(w, "%s\n", red(tracerrErr.Msg))
+			for _, frame := range tracerrErr.Frames {
+				printFrame(w, frame)
+			}
+		} else {
+			// It's a standard error, just print its message.
+			fmt.Fprintf(w, "%s\n", red(currentErr.Error()))
+		}
+
+		// Move to the next error in the chain.
+		currentErr = errors.Unwrap(currentErr)
+		isFirst = false
+	}
+}
+
+// printFrame formats and prints a single stack frame with source code context.
+func printFrame(w io.Writer, frame Frame) {
+	location := gray(fmt.Sprintf("%s:%d", filepath.Base(frame.File), frame.Line))
+	function := yellow(frame.Function)
+	fmt.Fprintf(w, "  at %s (%s)\n", function, location)
+
+	lines, startLine, err := readSourceContextLines(frame.File, frame.Line, 1)
+	if err != nil {
+		fmt.Fprintf(w, "    %s\n", gray("Could not read source file"))
+		return
+	}
+
+	codeBlock := strings.Join(lines, "\n")
+	var highlightedBuf bytes.Buffer
+	err = quick.Highlight(&highlightedBuf, codeBlock, "go", "terminal256", "monokai")
+	if err != nil {
+		highlightedBuf.WriteString(codeBlock)
+	}
+	highlightedLines := strings.Split(highlightedBuf.String(), "\n")
+
+	lineNumWidth := len(fmt.Sprintf("%d", startLine+len(lines)-1))
+	errorLineIndex := frame.Line - startLine
+
+	for i, hLine := range highlightedLines {
+		if i >= len(lines) {
 			continue
 		}
+		lineNum := startLine + i
+		isErrorLine := i == errorLineIndex
 
-		// Join lines to be highlighted by chroma
-		codeBlock := strings.Join(lines, "\n")
-		var highlightedBuf bytes.Buffer
-		// Highlight the code block using chroma for better readability
-		err = quick.Highlight(&highlightedBuf, codeBlock, "go", "terminal256", "monokai")
-		if err != nil {
-			// Fallback to non-highlighted if chroma fails
-			highlightedBuf.WriteString(codeBlock)
+		var gutter string
+		if isErrorLine {
+			gutter = boldGray(fmt.Sprintf("  %*d | ", lineNumWidth, lineNum))
+		} else {
+			gutter = gray(fmt.Sprintf("  %*d | ", lineNumWidth, lineNum))
 		}
-		highlightedLines := strings.Split(highlightedBuf.String(), "\n")
 
-		// Calculate width for line numbers for proper alignment
-		lineNumWidth := len(fmt.Sprintf("%d", startLine+len(lines)-1))
-		errorLineIndex := frame.Line - startLine
-
-		// Print the formatted, highlighted source context
-		for i, hLine := range highlightedLines {
-			if i >= len(lines) { // Ensure we don't go out of bounds
-				continue
-			}
-			lineNum := startLine + i
-			isErrorLine := i == errorLineIndex
-
-			var gutter string
-			if isErrorLine {
-				gutter = boldGray(fmt.Sprintf("  %*d | ", lineNumWidth, lineNum))
-			} else {
-				gutter = gray(fmt.Sprintf("  %*d | ", lineNumWidth, lineNum))
-			}
-
-			fmt.Fprintf(w, "%s%s\n", gutter, hLine)
-
-			if isErrorLine {
-				caretGutter := boldGray("  " + strings.Repeat(" ", lineNumWidth) + " | ")
-				// This assumes simple character alignment, which is usually fine for code
-				caretLine := red(strings.Repeat("^", len(lines[i])))
-				fmt.Fprintf(w, "%s%s\n", caretGutter, caretLine)
-			}
-		}
+		fmt.Fprintf(w, "%s%s\n", gutter, hLine)
 	}
 }
 
